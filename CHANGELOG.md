@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.11.5] - 2026-06-04
+
 - Fix queue-empty crashes when auto-announce is enabled or playback ends without a next song.
 - Fix Spotify autocomplete and token refresh failures so Spotify API errors do not terminate the bot.
 - Harden release, PR snapshot, and `yt-dlp` refresh workflow maintenance.
@@ -389,7 +391,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release
 
-[unreleased]: https://github.com/museofficial/muse/compare/v2.11.4...HEAD
+[unreleased]: https://github.com/museofficial/muse/compare/v2.11.5...HEAD
+[2.11.5]: https://github.com/museofficial/muse/compare/v2.11.4...v2.11.5
 [2.11.4]: https://github.com/museofficial/muse/compare/v2.11.3...v2.11.4
 [2.11.1]: https://github.com/museofficial/muse/compare/v2.11.0...v2.11.1
 [2.11.0]: https://github.com/museofficial/muse/compare/v2.10.1...v2.11.0
