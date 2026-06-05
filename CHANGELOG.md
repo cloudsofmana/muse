@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fix queue-empty crashes when auto-announce is enabled or playback ends without a next song.
+- Fix Spotify autocomplete and token refresh failures so Spotify API errors do not terminate the bot.
+- Harden release, PR snapshot, and `yt-dlp` refresh workflow maintenance.
+
 ## [2.11.4] - 2026-04-26
 - Add optional `YT_DLP_AUTO_UPDATE` startup refresh support and startup `YT_DLP_VERSION` logging.
 - Add scheduled, manual, and release-triggered GHCR image refreshes for the latest `yt-dlp`.
