@@ -302,21 +302,7 @@ export default class {
       if (this.getCurrent() && this.status !== STATUS.PAUSED) {
         await this.play();
       } else {
-        this.status = STATUS.IDLE;
-        this.audioPlayer?.stop(true);
-
-        const settings = await getGuildSettings(this.guildId);
-
-        const {secondsToWaitAfterQueueEmpties} = settings;
-        if (secondsToWaitAfterQueueEmpties !== 0) {
-          this.disconnectTimer = setTimeout(() => {
-            // Make sure we are not accidentally playing
-            // when disconnecting
-            if (this.status === STATUS.IDLE) {
-              this.disconnect();
-            }
-          }, secondsToWaitAfterQueueEmpties * 1000);
-        }
+        await this.finishQueue();
       }
     } catch (error: unknown) {
       this.queuePosition--;
@@ -662,15 +648,43 @@ export default class {
     }
 
     if (newState.status === AudioPlayerStatus.Idle && this.status === STATUS.PLAYING) {
+      if (!this.canGoForward(1)) {
+        await this.finishQueue();
+        return;
+      }
+
       await this.forward(1);
+      const currentSong = this.getCurrent();
+      if (!currentSong) {
+        return;
+      }
+
       // Auto announce the next song if configured to
       const settings = await getGuildSettings(this.guildId);
       const {autoAnnounceNextSong} = settings;
       if (autoAnnounceNextSong && this.currentChannel) {
         await this.currentChannel.send({
-          embeds: this.getCurrent() ? [buildPlayingMessageEmbed(this)] : [],
+          embeds: [buildPlayingMessageEmbed(this)],
         });
       }
+    }
+  }
+
+  private async finishQueue(): Promise<void> {
+    this.status = STATUS.IDLE;
+    this.audioPlayer?.stop(true);
+
+    const settings = await getGuildSettings(this.guildId);
+
+    const {secondsToWaitAfterQueueEmpties} = settings;
+    if (secondsToWaitAfterQueueEmpties !== 0) {
+      this.disconnectTimer = setTimeout(() => {
+        // Make sure we are not accidentally playing
+        // when disconnecting
+        if (this.status === STATUS.IDLE) {
+          this.disconnect();
+        }
+      }, secondsToWaitAfterQueueEmpties * 1000);
     }
   }
 
