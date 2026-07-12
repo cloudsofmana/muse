@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fall back once to a closely matched audio-focused upload when a music video is age-restricted.
 - Prevent unavailable YouTube tracks and rejected automatic queue advances from restarting Muse.
 - Install current yt-dlp JavaScript challenge support and use the bundled Node.js runtime.
+- Fix provider routing and autocomplete allocation, playlist limits and pagination, and YouTube chapter parsing.
+- Fix queue command boundaries, queue insertion, and concurrent Player playback and voice-recovery transitions.
+- Correct SponsorBlock trimming and restore pre-duck volume after overlapping speakers finish.
+- Make cache writes safe under concurrent downloads, reconcile every indexed row, and reject negative cache limits.
+- Reject blank required credentials and honor explicit SQLite database paths during legacy migrations.
+- Add a Node.js behavior suite for commands, providers, queueing, playback, and caching.
 
 ## [2.11.5] - 2026-06-04
 
@@ -399,6 +405,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [unreleased]: https://github.com/museofficial/muse/compare/v2.11.5...HEAD
 [2.11.5]: https://github.com/museofficial/muse/compare/v2.11.4...v2.11.5
 [2.11.4]: https://github.com/museofficial/muse/compare/v2.11.3...v2.11.4
+[2.11.3]: https://github.com/museofficial/muse/compare/v2.11.2...v2.11.3
+[2.11.2]: https://github.com/museofficial/muse/compare/v2.11.1...v2.11.2
 [2.11.1]: https://github.com/museofficial/muse/compare/v2.11.0...v2.11.1
 [2.11.0]: https://github.com/museofficial/muse/compare/v2.10.1...v2.11.0
 [2.10.1]: https://github.com/museofficial/muse/compare/v2.10.0...v2.10.1
@@ -472,5 +480,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [0.2.0]: https://github.com/codetheweb/muse/releases/tag/v0.2.0
 [0.1.1]: https://github.com/codetheweb/muse/releases/tag/v0.1.1
 [0.1.0]: https://github.com/codetheweb/muse/releases/tag/v0.1.0
-
-[2.11.3]: https://github.com/museofficial/muse/compare/v2.11.1...v2.11.3

@@ -1,6 +1,5 @@
-import {VoiceChannel, Snowflake} from 'discord.js';
+import {VoiceChannel} from 'discord.js';
 import {Readable} from 'stream';
-import {setTimeout as sleep} from 'timers/promises';
 import hasha from 'hasha';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
@@ -15,55 +14,31 @@ import {
   joinVoiceChannel,
   StreamType,
   VoiceConnection,
-  VoiceConnectionDisconnectReason,
   VoiceConnectionStatus,
 } from '@discordjs/voice';
 import FileCacheProvider from './file-cache.js';
+import {PlaybackAttemptTracker, type PlaybackAttemptContext, type PlaybackAttemptToken} from './playback-attempt.js';
+import {
+  DEFAULT_VOLUME,
+  MediaSource,
+  STATUS,
+  type AgeRestrictedFallbackResolver,
+  type PlayerEvents,
+  type QueuedPlaylist,
+  type QueuedSong,
+  type SongMetadata,
+} from './player-types.js';
+import {destroyVoiceConnection, recoverVoiceConnection} from './voice-connection-recovery.js';
 import debug from '../utils/debug.js';
 import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
 import {getYouTubeMediaSource, YtDlpMediaUnavailableError} from '../utils/yt-dlp.js';
 import {Setting} from '@prisma/client';
 
-export enum MediaSource {
-  Youtube,
-  HLS,
-}
+export {DEFAULT_VOLUME, MediaSource, STATUS};
+export type {AgeRestrictedFallbackResolver, PlayerEvents, QueuedPlaylist, QueuedSong, SongMetadata};
 
-export interface QueuedPlaylist {
-  title: string;
-  source: string;
-}
-
-export interface SongMetadata {
-  title: string;
-  artist: string;
-  url: string; // For YT, it's the video ID (not the full URI)
-  length: number;
-  offset: number;
-  playlist: QueuedPlaylist | null;
-  isLive: boolean;
-  thumbnailUrl: string | null;
-  source: MediaSource;
-}
-export interface QueuedSong extends SongMetadata {
-  addedInChannelId: Snowflake;
-  requestedBy: string;
-}
-
-export type AgeRestrictedFallbackResolver = (song: QueuedSong) => Promise<SongMetadata | null>;
-
-export enum STATUS {
-  PLAYING,
-  PAUSED,
-  IDLE,
-}
-
-export interface PlayerEvents {
-  statusChange: (oldStatus: STATUS, newStatus: STATUS) => void;
-}
-
-export const DEFAULT_VOLUME = 100;
+type PlayerPlaybackAttemptContext = PlaybackAttemptContext<QueuedSong, VoiceConnection>;
 
 export default class {
   public voiceConnection: VoiceConnection | null = null;
@@ -79,8 +54,11 @@ export default class {
   private volume?: number;
   private defaultVolume: number = DEFAULT_VOLUME;
   private nowPlaying: QueuedSong | null = null;
+  private currentQueueEntryVersion = 0;
+  private nowPlayingQueueEntryVersion: number | null = null;
+  private readonly playbackAttempts: PlaybackAttemptTracker<QueuedSong, VoiceConnection>;
+  private readonly programmaticallyStoppedAudioPlayers = new WeakSet<AudioPlayer>();
   private playPositionInterval: NodeJS.Timeout | undefined;
-  private lastSongURL = '';
 
   private positionInSeconds = 0;
   private readonly fileCache: FileCacheProvider;
@@ -88,12 +66,20 @@ export default class {
   private disconnectTimer: NodeJS.Timeout | null = null;
 
   private readonly channelToSpeakingUsers: Map<string, Set<string>> = new Map();
+  private volumeBeforeVoiceActivity?: number;
+  private voiceActivityVolumeTarget?: number;
+  private voiceActivitySessionGeneration = 0;
   private hasRegisteredVoiceActivityListener = false;
 
   constructor(fileCache: FileCacheProvider, guildId: string, ageRestrictedFallbackResolver?: AgeRestrictedFallbackResolver) {
     this.fileCache = fileCache;
     this.guildId = guildId;
     this.ageRestrictedFallbackResolver = ageRestrictedFallbackResolver;
+    this.playbackAttempts = new PlaybackAttemptTracker(() => ({
+      currentSong: this.getCurrent(),
+      queueEntryVersion: this.getCurrentQueueEntryId(),
+      currentConnection: this.voiceConnection,
+    }));
   }
 
   async connect(channel: VoiceChannel): Promise<void> {
@@ -131,78 +117,60 @@ export default class {
 
       debug(`Voice connection state changed: ${oldState.status} -> ${newState.status}`);
 
-      if (newState.status === VoiceConnectionStatus.Ready && !this.hasRegisteredVoiceActivityListener) {
+      if (this.voiceConnection === voiceConnection
+        && newState.status === VoiceConnectionStatus.Ready
+        && !this.hasRegisteredVoiceActivityListener) {
         this.registerVoiceActivityListener(guildSettings);
         this.hasRegisteredVoiceActivityListener = true;
       }
     });
 
-    voiceConnection.on(VoiceConnectionStatus.Disconnected, this.onVoiceConnectionDisconnect.bind(this));
+    voiceConnection.on(
+      VoiceConnectionStatus.Disconnected,
+      this.onVoiceConnectionDisconnect.bind(this, voiceConnection),
+    );
 
     try {
       await this.waitForVoiceConnectionReady(voiceConnection);
     } catch {
       const {status} = voiceConnection.state;
-      voiceConnection.destroy();
-      this.voiceConnection = null;
+      destroyVoiceConnection(voiceConnection);
+
+      if (this.voiceConnection === voiceConnection) {
+        this.voiceConnection = null;
+      }
+
       throw new Error(`Failed to connect to the voice channel (last state: ${status}, rejoin attempts: ${voiceConnection.rejoinAttempts}, recent states: ${stateTransitions.join(' -> ')}).`);
     }
   }
 
   disconnect(): void {
+    this.playbackAttempts.invalidate();
+    this.voiceActivitySessionGeneration++;
+
     if (this.voiceConnection) {
       if (this.status === STATUS.PLAYING) {
         this.pause();
       }
 
       this.loopCurrentSong = false;
-      this.voiceConnection.destroy();
-      this.audioPlayer?.stop(true);
+      destroyVoiceConnection(this.voiceConnection);
+      this.stopAudioPlayer(true);
 
       this.voiceConnection = null;
       this.audioPlayer = null;
       this.audioResource = null;
       this.currentChannel = undefined;
       this.channelToSpeakingUsers.clear();
+      this.volumeBeforeVoiceActivity = undefined;
+      this.voiceActivityVolumeTarget = undefined;
       this.hasRegisteredVoiceActivityListener = false;
     }
   }
 
   async seek(positionSeconds: number): Promise<void> {
-    this.status = STATUS.PAUSED;
-
-    const voiceConnection = await this.ensureVoiceConnectionReady();
-
-    const currentSong = this.getCurrent();
-
-    if (!currentSong) {
-      throw new Error('No song currently playing');
-    }
-
-    if (positionSeconds > currentSong.length) {
-      throw new Error('Seek position is outside the range of the song.');
-    }
-
-    let realPositionSeconds = positionSeconds;
-    let to: number | undefined;
-    if (currentSong.offset !== undefined) {
-      realPositionSeconds += currentSong.offset;
-      to = currentSong.length + currentSong.offset;
-    }
-
-    const stream = await this.getStream(currentSong, {seek: realPositionSeconds, to});
-    this.audioPlayer = createAudioPlayer({
-      behaviors: {
-        // Needs to be somewhat high for livestreams
-        maxMissedFrames: 50,
-      },
-    });
-    voiceConnection.subscribe(this.audioPlayer);
-    this.playAudioPlayerResource(this.createAudioStream(stream));
-    this.attachListeners();
-    this.startTrackingPosition(positionSeconds);
-
-    this.status = STATUS.PLAYING;
+    const attempt = this.playbackAttempts.begin();
+    await this.seekWithAttempt(positionSeconds, attempt);
   }
 
   async forwardSeek(positionSeconds: number): Promise<void> {
@@ -214,87 +182,8 @@ export default class {
   }
 
   async play(allowAgeRestrictedFallback = true): Promise<void> {
-    const voiceConnection = await this.ensureVoiceConnectionReady();
-
-    const currentSong = this.getCurrent();
-
-    if (!currentSong) {
-      throw new Error('Queue empty.');
-    }
-
-    // Cancel any pending idle disconnection
-    if (this.disconnectTimer) {
-      clearInterval(this.disconnectTimer);
-      this.disconnectTimer = null;
-    }
-
-    // Resume from paused state
-    if (this.status === STATUS.PAUSED && currentSong.url === this.nowPlaying?.url) {
-      if (this.audioPlayer) {
-        this.audioPlayer.unpause();
-        this.status = STATUS.PLAYING;
-        this.startTrackingPosition();
-        return;
-      }
-
-      // Was disconnected, need to recreate stream
-      if (!currentSong.isLive) {
-        return this.seek(this.getPosition());
-      }
-    }
-
-    try {
-      let positionSeconds: number | undefined;
-      let to: number | undefined;
-      if (currentSong.offset !== undefined) {
-        positionSeconds = currentSong.offset;
-        to = currentSong.length + currentSong.offset;
-      }
-
-      const stream = await this.getStream(currentSong, {seek: positionSeconds, to});
-      this.audioPlayer = createAudioPlayer({
-        behaviors: {
-          // Needs to be somewhat high for livestreams
-          maxMissedFrames: 50,
-        },
-      });
-      voiceConnection.subscribe(this.audioPlayer);
-      this.playAudioPlayerResource(this.createAudioStream(stream));
-
-      this.attachListeners();
-
-      this.status = STATUS.PLAYING;
-      this.nowPlaying = currentSong;
-
-      if (currentSong.url === this.lastSongURL) {
-        this.startTrackingPosition();
-      } else {
-        // Reset position counter
-        this.startTrackingPosition(0);
-        this.lastSongURL = currentSong.url;
-      }
-    } catch (error: unknown) {
-      const isGone = typeof error === 'object'
-        && error !== null
-        && 'statusCode' in error
-        && error.statusCode === 410;
-
-      if (error instanceof YtDlpMediaUnavailableError
-        && error.reason === 'age-restricted'
-        && allowAgeRestrictedFallback
-        && await this.tryAgeRestrictedAudioFallback(currentSong)) {
-        return;
-      }
-
-      if (error instanceof YtDlpMediaUnavailableError || isGone) {
-        const detail = error instanceof Error ? error.message : 'media returned HTTP 410';
-        console.warn(`Skipping unplayable YouTube track for guild ${this.guildId}: ${detail}`);
-        await this.advancePastUnplayableTrack();
-        return;
-      }
-
-      throw error;
-    }
+    const attempt = this.playbackAttempts.begin();
+    await this.playWithAttempt(attempt, allowAgeRestrictedFallback);
   }
 
   pause(): void {
@@ -302,6 +191,7 @@ export default class {
       throw new Error('Not currently playing.');
     }
 
+    this.playbackAttempts.invalidate();
     this.status = STATUS.PAUSED;
 
     if (this.audioPlayer) {
@@ -312,33 +202,64 @@ export default class {
   }
 
   async forward(skip: number): Promise<void> {
+    const originalQueuePosition = this.queuePosition;
+    const originalQueueEntryVersion = this.currentQueueEntryVersion;
     this.manualForward(skip);
+    const destinationSong = this.getCurrent();
+    const destinationQueueEntryVersion = this.currentQueueEntryVersion;
+    let destinationPlayback: PlayerPlaybackAttemptContext | null = null;
 
     try {
-      if (this.getCurrent() && this.status !== STATUS.PAUSED) {
-        await this.play();
-      } else {
+      if (!destinationSong) {
         await this.finishQueue();
+      } else if (this.status !== STATUS.PAUSED) {
+        const playPromise = this.play();
+        const destinationConnection = this.voiceConnection;
+        if (destinationConnection && destinationSong && destinationQueueEntryVersion !== null) {
+          destinationPlayback = this.playbackAttempts.capture(
+            this.playbackAttempts.latest(),
+            destinationSong,
+            destinationQueueEntryVersion,
+            destinationConnection,
+          );
+        }
+
+        await playPromise;
       }
     } catch (error: unknown) {
-      this.queuePosition--;
+      const failedTransitionStillOwnsDestination = this.getCurrent() === destinationSong
+        && this.currentQueueEntryVersion === destinationQueueEntryVersion
+        && (destinationPlayback === null || this.playbackAttempts.owns(destinationPlayback));
+      if (failedTransitionStillOwnsDestination) {
+        this.queuePosition = originalQueuePosition;
+        this.currentQueueEntryVersion = originalQueueEntryVersion;
+      }
+
       throw error;
     }
   }
 
   registerVoiceActivityListener(guildSettings: Setting) {
     const {turnDownVolumeWhenPeopleSpeak, turnDownVolumeWhenPeopleSpeakTarget} = guildSettings;
-    if (!turnDownVolumeWhenPeopleSpeak || !this.voiceConnection) {
+    const {voiceConnection, currentChannel} = this;
+    if (!turnDownVolumeWhenPeopleSpeak || !voiceConnection || !currentChannel) {
       return;
     }
 
-    this.voiceConnection.receiver.speaking.on('start', (userId: string) => {
-      if (!this.currentChannel) {
+    const voiceActivitySessionGeneration = ++this.voiceActivitySessionGeneration;
+    const isCurrentVoiceActivitySession = () => (
+      voiceActivitySessionGeneration === this.voiceActivitySessionGeneration
+      && voiceConnection === this.voiceConnection
+      && currentChannel === this.currentChannel
+    );
+
+    voiceConnection.receiver.speaking.on('start', (userId: string) => {
+      if (!isCurrentVoiceActivitySession()) {
         return;
       }
 
-      const member = this.currentChannel.members.get(userId);
-      const channelId = this.currentChannel?.id;
+      const member = currentChannel.members.get(userId);
+      const {id: channelId} = currentChannel;
 
       if (member) {
         if (!this.channelToSpeakingUsers.has(channelId)) {
@@ -351,20 +272,12 @@ export default class {
       this.suppressVoiceWhenPeopleAreSpeaking(turnDownVolumeWhenPeopleSpeakTarget);
     });
 
-    this.voiceConnection.receiver.speaking.on('end', (userId: string) => {
-      if (!this.currentChannel) {
+    voiceConnection.receiver.speaking.on('end', (userId: string) => {
+      if (!isCurrentVoiceActivitySession()) {
         return;
       }
 
-      const member = this.currentChannel.members.get(userId);
-      const channelId = this.currentChannel.id;
-      if (member) {
-        if (!this.channelToSpeakingUsers.has(channelId)) {
-          this.channelToSpeakingUsers.set(channelId, new Set());
-        }
-
-        this.channelToSpeakingUsers.get(channelId)?.delete(member.id);
-      }
+      this.channelToSpeakingUsers.get(currentChannel.id)?.delete(userId);
 
       this.suppressVoiceWhenPeopleAreSpeaking(turnDownVolumeWhenPeopleSpeakTarget);
     });
@@ -377,9 +290,17 @@ export default class {
 
     const speakingUsers = this.channelToSpeakingUsers.get(this.currentChannel.id);
     if (speakingUsers && speakingUsers.size > 0) {
-      this.setVolume(turnDownVolumeWhenPeopleSpeakTarget);
-    } else {
-      this.setVolume(this.defaultVolume);
+      if (this.volumeBeforeVoiceActivity === undefined) {
+        this.volumeBeforeVoiceActivity = this.getVolume();
+      }
+
+      this.voiceActivityVolumeTarget = turnDownVolumeWhenPeopleSpeakTarget;
+      this.setAudioPlayerVolume(turnDownVolumeWhenPeopleSpeakTarget);
+    } else if (this.volumeBeforeVoiceActivity !== undefined) {
+      const {volumeBeforeVoiceActivity} = this;
+      this.volumeBeforeVoiceActivity = undefined;
+      this.voiceActivityVolumeTarget = undefined;
+      this.setAudioPlayerVolume(volumeBeforeVoiceActivity);
     }
   }
 
@@ -390,6 +311,7 @@ export default class {
   manualForward(skip: number): void {
     if (this.canGoForward(skip)) {
       this.queuePosition += skip;
+      this.currentQueueEntryVersion++;
       this.positionInSeconds = 0;
       this.stopTrackingPosition();
     } else {
@@ -404,6 +326,7 @@ export default class {
   async back(): Promise<void> {
     if (this.canGoBack()) {
       this.queuePosition--;
+      this.currentQueueEntryVersion++;
       this.positionInSeconds = 0;
       this.stopTrackingPosition();
 
@@ -423,6 +346,10 @@ export default class {
     return null;
   }
 
+  getCurrentQueueEntryId(): number | null {
+    return this.getCurrent() === null ? null : this.currentQueueEntryVersion;
+  }
+
   /**
    * Returns queue, not including the current song.
    * @returns {QueuedSong[]}
@@ -431,14 +358,20 @@ export default class {
     return this.queue.slice(this.queuePosition + 1);
   }
 
-  add(song: QueuedSong, {immediate = false} = {}): void {
-    if (song.playlist || !immediate) {
+  add(song: QueuedSong, {immediate = false, immediateOffset = 0} = {}): void {
+    const currentSong = this.getCurrent();
+
+    if (immediate) {
+      // Add as the next song to be played
+      const insertAt = this.queuePosition + immediateOffset + 1;
+      this.queue = [...this.queue.slice(0, insertAt), song, ...this.queue.slice(insertAt)];
+    } else {
       // Add to end of queue
       this.queue.push(song);
-    } else {
-      // Add as the next song to be played
-      const insertAt = this.queuePosition + 1;
-      this.queue = [...this.queue.slice(0, insertAt), song, ...this.queue.slice(insertAt)];
+    }
+
+    if (this.getCurrent() !== currentSong) {
+      this.currentQueueEntryVersion++;
     }
   }
 
@@ -468,6 +401,7 @@ export default class {
 
   removeCurrent(): void {
     this.queue = [...this.queue.slice(0, this.queuePosition), ...this.queue.slice(this.queuePosition + 1)];
+    this.currentQueueEntryVersion++;
   }
 
   queueSize(): number {
@@ -482,6 +416,7 @@ export default class {
     this.disconnect();
     this.queuePosition = 0;
     this.queue = [];
+    this.currentQueueEntryVersion++;
   }
 
   move(from: number, to: number): QueuedSong {
@@ -497,12 +432,205 @@ export default class {
   setVolume(level: number): void {
     // Level should be a number between 0 and 100 = 0% => 100%
     this.volume = level;
-    this.setAudioPlayerVolume(level);
+
+    if (this.volumeBeforeVoiceActivity === undefined) {
+      this.setAudioPlayerVolume(level);
+    } else {
+      this.volumeBeforeVoiceActivity = level;
+      this.setAudioPlayerVolume(this.voiceActivityVolumeTarget);
+    }
   }
 
   getVolume(): number {
     // Only use default volume if player volume is not already set (in the event of a reconnect we shouldn't reset)
-    return this.volume ?? this.defaultVolume;
+    return this.voiceActivityVolumeTarget ?? this.volume ?? this.defaultVolume;
+  }
+
+  private async seekWithAttempt(positionSeconds: number, attempt: PlaybackAttemptToken): Promise<void> {
+    this.status = STATUS.PAUSED;
+
+    const currentSong = this.getCurrent();
+    const currentQueueEntryVersion = this.getCurrentQueueEntryId();
+    const voiceConnection = await this.ensureVoiceConnectionReady();
+
+    if (!this.playbackAttempts.isCurrent(attempt, voiceConnection)) {
+      return;
+    }
+
+    if (!currentSong) {
+      throw new Error('No song currently playing');
+    }
+
+    if (currentQueueEntryVersion === null) {
+      return;
+    }
+
+    const playback = this.playbackAttempts.capture(
+      attempt,
+      currentSong,
+      currentQueueEntryVersion,
+      voiceConnection,
+    );
+    if (!this.playbackAttempts.owns(playback)) {
+      return;
+    }
+
+    if (positionSeconds > currentSong.length) {
+      throw new Error('Seek position is outside the range of the song.');
+    }
+
+    let realPositionSeconds = positionSeconds;
+    let to: number | undefined;
+    if (currentSong.offset !== undefined) {
+      realPositionSeconds += currentSong.offset;
+      to = currentSong.length + currentSong.offset;
+    }
+
+    const stream = await this.getStream(currentSong, {seek: realPositionSeconds, to});
+    if (!this.playbackAttempts.owns(playback)) {
+      this.destroyStaleStream(stream);
+      return;
+    }
+
+    this.audioPlayer = createAudioPlayer({
+      behaviors: {
+        // Needs to be somewhat high for livestreams
+        maxMissedFrames: 50,
+      },
+    });
+    voiceConnection.subscribe(this.audioPlayer);
+    this.playAudioPlayerResource(this.createAudioStream(stream));
+    this.attachListeners();
+    this.startTrackingPosition(positionSeconds);
+
+    this.status = STATUS.PLAYING;
+    this.nowPlaying = currentSong;
+    this.nowPlayingQueueEntryVersion = currentQueueEntryVersion;
+  }
+
+  private async playWithAttempt(attempt: PlaybackAttemptToken, allowAgeRestrictedFallback: boolean): Promise<void> {
+    const currentSong = this.getCurrent();
+    const currentQueueEntryVersion = this.getCurrentQueueEntryId();
+    const voiceConnection = await this.ensureVoiceConnectionReady();
+
+    if (!this.playbackAttempts.isCurrent(attempt, voiceConnection)) {
+      return;
+    }
+
+    if (!currentSong) {
+      throw new Error('Queue empty.');
+    }
+
+    if (currentQueueEntryVersion === null) {
+      return;
+    }
+
+    const playback = this.playbackAttempts.capture(
+      attempt,
+      currentSong,
+      currentQueueEntryVersion,
+      voiceConnection,
+    );
+    if (!this.playbackAttempts.owns(playback)) {
+      return;
+    }
+
+    // Cancel any pending idle disconnection
+    if (this.disconnectTimer) {
+      clearInterval(this.disconnectTimer);
+      this.disconnectTimer = null;
+    }
+
+    // Resume from paused state
+    if (this.status === STATUS.PAUSED
+      && currentSong === this.nowPlaying
+      && this.currentQueueEntryVersion === this.nowPlayingQueueEntryVersion) {
+      if (this.audioPlayer) {
+        this.audioPlayer.unpause();
+        this.status = STATUS.PLAYING;
+        this.startTrackingPosition();
+        return;
+      }
+
+      // Was disconnected, need to recreate stream
+      if (!currentSong.isLive) {
+        return this.seekWithAttempt(this.getPosition(), attempt);
+      }
+    }
+
+    try {
+      let positionSeconds: number | undefined;
+      let to: number | undefined;
+      if (currentSong.offset !== undefined) {
+        positionSeconds = currentSong.offset;
+        to = currentSong.length + currentSong.offset;
+      }
+
+      const stream = await this.getStream(currentSong, {seek: positionSeconds, to});
+      if (!this.playbackAttempts.owns(playback)) {
+        this.destroyStaleStream(stream);
+        return;
+      }
+
+      this.audioPlayer = createAudioPlayer({
+        behaviors: {
+          // Needs to be somewhat high for livestreams
+          maxMissedFrames: 50,
+        },
+      });
+      voiceConnection.subscribe(this.audioPlayer);
+      this.playAudioPlayerResource(this.createAudioStream(stream));
+
+      this.attachListeners();
+
+      this.status = STATUS.PLAYING;
+      this.nowPlaying = currentSong;
+      this.nowPlayingQueueEntryVersion = currentQueueEntryVersion;
+      this.startTrackingPosition(0);
+    } catch (error: unknown) {
+      await this.handlePlaybackError(
+        error,
+        playback,
+        allowAgeRestrictedFallback,
+      );
+    }
+  }
+
+  private async handlePlaybackError(
+    error: unknown,
+    playback: PlayerPlaybackAttemptContext,
+    allowAgeRestrictedFallback: boolean,
+  ): Promise<void> {
+    if (!this.playbackAttempts.owns(playback)) {
+      throw error;
+    }
+
+    const isGone = typeof error === 'object'
+      && error !== null
+      && 'statusCode' in error
+      && error.statusCode === 410;
+
+    if (error instanceof YtDlpMediaUnavailableError
+      && error.reason === 'age-restricted'
+      && allowAgeRestrictedFallback) {
+      const fallbackHandled = await this.tryAgeRestrictedAudioFallback(playback);
+      if (fallbackHandled) {
+        return;
+      }
+
+      if (!this.playbackAttempts.owns(playback)) {
+        throw error;
+      }
+    }
+
+    if (error instanceof YtDlpMediaUnavailableError || isGone) {
+      const detail = error instanceof Error ? error.message : 'media returned HTTP 410';
+      console.warn(`Skipping unplayable YouTube track for guild ${this.guildId}: ${detail}`);
+      await this.advancePastUnplayableTrack();
+      return;
+    }
+
+    throw error;
   }
 
   private getHashForCache(url: string): string {
@@ -511,9 +639,9 @@ export default class {
 
   private async getStream(song: QueuedSong, options: {seek?: number; to?: number} = {}): Promise<Readable> {
     if (this.status === STATUS.PLAYING) {
-      this.audioPlayer?.stop();
+      this.stopAudioPlayer();
     } else if (this.status === STATUS.PAUSED) {
-      this.audioPlayer?.stop(true);
+      this.stopAudioPlayer(true);
     }
 
     if (song.source === MediaSource.HLS) {
@@ -582,6 +710,7 @@ export default class {
   private stopTrackingPosition(): void {
     if (this.playPositionInterval) {
       clearInterval(this.playPositionInterval);
+      this.playPositionInterval = undefined;
     }
   }
 
@@ -594,8 +723,16 @@ export default class {
       return;
     }
 
-    if (this.audioPlayer.listeners(AudioPlayerStatus.Idle).length === 0) {
-      this.audioPlayer.on(AudioPlayerStatus.Idle, (oldState, newState) => {
+    const {audioPlayer} = this;
+    const queueEntryVersion = this.currentQueueEntryVersion;
+    if (audioPlayer.listeners(AudioPlayerStatus.Idle).length === 0) {
+      audioPlayer.on(AudioPlayerStatus.Idle, (oldState, newState) => {
+        if (this.programmaticallyStoppedAudioPlayers.has(audioPlayer)
+          || this.audioPlayer !== audioPlayer
+          || this.currentQueueEntryVersion !== queueEntryVersion) {
+          return;
+        }
+
         void this.onAudioPlayerIdle(oldState, newState).catch(error => {
           console.error(`Audio player idle handler failed for guild ${this.guildId}:`, error);
         });
@@ -603,36 +740,17 @@ export default class {
     }
   }
 
-  private async onVoiceConnectionDisconnect(): Promise<void> {
-    if (!this.voiceConnection || this.voiceConnection.state.status !== VoiceConnectionStatus.Disconnected) {
-      return;
-    }
-
-    const disconnectedState = this.voiceConnection.state;
-    if (disconnectedState.reason === VoiceConnectionDisconnectReason.WebSocketClose && disconnectedState.closeCode === 4014) {
-      try {
-        await Promise.race([
-          entersState(this.voiceConnection, VoiceConnectionStatus.Connecting, 5_000),
-          entersState(this.voiceConnection, VoiceConnectionStatus.Signalling, 5_000),
-        ]);
-        return;
-      } catch {
-        this.disconnect();
-        return;
-      }
-    }
-
-    if (this.voiceConnection.rejoinAttempts < 5) {
-      await sleep((this.voiceConnection.rejoinAttempts + 1) * 5_000);
-
-      if (this.voiceConnection && this.voiceConnection.state.status === VoiceConnectionStatus.Disconnected) {
-        if (this.voiceConnection.rejoin()) {
-          return;
+  private async onVoiceConnectionDisconnect(voiceConnection: VoiceConnection): Promise<void> {
+    await recoverVoiceConnection(voiceConnection, {
+      isCurrent: candidate => this.voiceConnection === candidate,
+      dispose: candidate => {
+        if (this.voiceConnection === candidate) {
+          this.disconnect();
+        } else {
+          destroyVoiceConnection(candidate);
         }
-      }
-    }
-
-    this.disconnect();
+      },
+    });
   }
 
   private async ensureVoiceConnectionReady(): Promise<VoiceConnection> {
@@ -660,20 +778,29 @@ export default class {
     await this.play();
   }
 
-  private async tryAgeRestrictedAudioFallback(song: QueuedSong): Promise<boolean> {
+  private async tryAgeRestrictedAudioFallback(playback: PlayerPlaybackAttemptContext): Promise<boolean> {
+    const {song, queueEntryVersion, attempt, connection} = playback;
     if (!this.ageRestrictedFallbackResolver || song.source !== MediaSource.Youtube) {
       return false;
+    }
+
+    if (!this.playbackAttempts.owns(playback)) {
+      return true;
     }
 
     let fallback: SongMetadata | null;
     try {
       fallback = await this.ageRestrictedFallbackResolver(song);
     } catch {
+      if (!this.playbackAttempts.owns(playback)) {
+        return true;
+      }
+
       console.warn(`Audio fallback search failed for age-restricted track in guild ${this.guildId}.`);
       return false;
     }
 
-    if (this.getCurrent() !== song) {
+    if (!this.playbackAttempts.owns(playback)) {
       return true;
     }
 
@@ -689,13 +816,20 @@ export default class {
       requestedBy: song.requestedBy,
     };
     this.queue[queuePosition] = replacement;
+    const replacementPlayback = this.playbackAttempts.capture(
+      attempt,
+      replacement,
+      queueEntryVersion,
+      connection,
+    );
     console.warn(`Trying audio fallback for age-restricted YouTube track in guild ${this.guildId}: ${song.url} -> ${replacement.url}`);
 
     try {
-      await this.play(false);
+      await this.playWithAttempt(attempt, false);
       return true;
     } catch (error: unknown) {
-      if (this.queue[queuePosition] === replacement) {
+      if (this.playbackAttempts.owns(replacementPlayback)
+        && this.queue[queuePosition] === replacement) {
         this.queue[queuePosition] = song;
       }
 
@@ -745,8 +879,10 @@ export default class {
   }
 
   private async finishQueue(): Promise<void> {
+    this.playbackAttempts.invalidate();
+    this.stopTrackingPosition();
     this.status = STATUS.IDLE;
-    this.audioPlayer?.stop(true);
+    this.stopAudioPlayer(true);
 
     const settings = await getGuildSettings(this.guildId);
 
@@ -832,5 +968,20 @@ export default class {
   private setAudioPlayerVolume(level?: number) {
     // Audio resource expects a float between 0 and 1 to represent level percentage
     this.audioResource?.volume?.setVolume((level ?? this.getVolume()) / 100);
+  }
+
+  private stopAudioPlayer(force = false): void {
+    if (!this.audioPlayer) {
+      return;
+    }
+
+    this.programmaticallyStoppedAudioPlayers.add(this.audioPlayer);
+    this.audioPlayer.stop(force);
+  }
+
+  private destroyStaleStream(stream: Readable): void {
+    if (!stream.destroyed) {
+      stream.destroy();
+    }
   }
 }
