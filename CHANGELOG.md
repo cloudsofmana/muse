@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.11.6] - 2026-07-12
+
 - Add optional age-verified YouTube cookie-file support for age-restricted playback.
 - Fall back once to a closely matched audio-focused upload when a music video is age-restricted.
 - Prevent unavailable YouTube tracks and rejected automatic queue advances from restarting Muse.
@@ -402,7 +404,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release
 
-[unreleased]: https://github.com/museofficial/muse/compare/v2.11.5...HEAD
+[unreleased]: https://github.com/museofficial/muse/compare/v2.11.6...HEAD
+[2.11.6]: https://github.com/museofficial/muse/compare/v2.11.5...v2.11.6
 [2.11.5]: https://github.com/museofficial/muse/compare/v2.11.4...v2.11.5
 [2.11.4]: https://github.com/museofficial/muse/compare/v2.11.3...v2.11.4
 [2.11.3]: https://github.com/museofficial/muse/compare/v2.11.2...v2.11.3
