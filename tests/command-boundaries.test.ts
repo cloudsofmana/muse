@@ -95,6 +95,8 @@ const makeInteraction = (options: {
   const reply = vi.fn().mockResolvedValue(undefined);
   const deferReply = vi.fn().mockResolvedValue(undefined);
   const editReply = vi.fn().mockResolvedValue(undefined);
+  const deleteReply = vi.fn().mockResolvedValue(undefined);
+  const followUp = vi.fn().mockResolvedValue(undefined);
 
   const interaction = {
     guild: {id: 'guild'},
@@ -107,9 +109,11 @@ const makeInteraction = (options: {
     reply,
     deferReply,
     editReply,
+    deleteReply,
+    followUp,
   } as unknown as ChatInputCommandInteraction;
 
-  return {interaction, reply, deferReply, editReply};
+  return {interaction, reply, deferReply, editReply, deleteReply, followUp};
 };
 
 const managerFor = (player: object) => ({get: () => player});
@@ -318,6 +322,50 @@ describe('/remove', () => {
 
     expect(upcoming).toEqual(['first']);
     expect(reply).toHaveBeenCalledWith(':wastebasket: removed');
+  });
+});
+
+describe('queue navigation error boundaries', () => {
+  it('publishes a successful /skip response after privately deferring failures', async () => {
+    const player = {
+      forward: vi.fn().mockResolvedValue(undefined),
+      getCurrent: vi.fn(() => null),
+    };
+    const {interaction, deferReply, deleteReply, followUp} = makeInteraction();
+
+    await new Skip(managerFor(player) as never).execute(interaction);
+
+    expect(deferReply).toHaveBeenCalledWith({ephemeral: true});
+    expect(followUp).toHaveBeenCalledWith({content: 'keep \'er movin\'', embeds: []});
+    expect(deleteReply).toHaveBeenCalledOnce();
+  });
+
+  it('defers /skip and preserves playback startup errors', async () => {
+    const failure = new Error('FFmpeg startup failed');
+    const player = {
+      forward: vi.fn().mockRejectedValue(failure),
+      getCurrent: vi.fn(() => ({title: 'Destination'})),
+    };
+    const {interaction, deferReply, editReply} = makeInteraction();
+
+    await expect(new Skip(managerFor(player) as never).execute(interaction)).rejects.toBe(failure);
+
+    expect(deferReply).toHaveBeenCalledWith({ephemeral: true});
+    expect(editReply).not.toHaveBeenCalled();
+  });
+
+  it('defers /unskip and preserves playback startup errors', async () => {
+    const failure = new Error('FFmpeg startup failed');
+    const player = {
+      back: vi.fn().mockRejectedValue(failure),
+      getCurrent: vi.fn(() => ({title: 'Destination'})),
+    };
+    const {interaction, deferReply, editReply} = makeInteraction();
+
+    await expect(new Unskip(managerFor(player) as never).execute(interaction)).rejects.toBe(failure);
+
+    expect(deferReply).toHaveBeenCalledWith({ephemeral: true});
+    expect(editReply).not.toHaveBeenCalled();
   });
 });
 

@@ -9,6 +9,11 @@ import debug from '../utils/debug.js';
 import {prisma} from '../utils/db.js';
 import {FileCache} from '@prisma/client';
 
+export type FileCacheEntry = {
+  generation: string;
+  path: string;
+};
+
 @injectable()
 export default class FileCacheProvider {
   private static readonly mutationQueue = new PQueue({concurrency: 1});
@@ -24,40 +29,50 @@ export default class FileCacheProvider {
    * @param hash lookup key
    */
   async getPathFor(hash: string): Promise<string | null> {
-    const model = await prisma.fileCache.findUnique({
-      where: {
-        hash,
-      },
-    });
+    return (await this.getEntryFor(hash))?.path ?? null;
+  }
 
-    if (!model) {
-      return null;
-    }
-
-    const resolvedPath = path.join(this.config.CACHE_DIR, hash);
-
-    try {
-      await fs.access(resolvedPath);
-    } catch (_: unknown) {
-      await prisma.fileCache.delete({
+  async getEntryFor(hash: string): Promise<FileCacheEntry | null> {
+    return (await FileCacheProvider.mutationQueue.add(async () => {
+      const model = await prisma.fileCache.findUnique({
         where: {
           hash,
         },
       });
 
-      return null;
-    }
+      if (!model) {
+        return null;
+      }
 
-    await prisma.fileCache.update({
-      where: {
-        hash,
-      },
-      data: {
-        accessedAt: new Date(),
-      },
-    });
+      const resolvedPath = path.join(this.config.CACHE_DIR, hash);
+      let stats;
 
-    return resolvedPath;
+      try {
+        stats = await fs.stat(resolvedPath, {bigint: true});
+      } catch (_: unknown) {
+        await prisma.fileCache.delete({
+          where: {
+            hash,
+          },
+        });
+
+        return null;
+      }
+
+      await prisma.fileCache.update({
+        where: {
+          hash,
+        },
+        data: {
+          accessedAt: new Date(),
+        },
+      });
+
+      return {
+        generation: this.getFileGeneration(stats),
+        path: resolvedPath,
+      };
+    })) ?? null;
   }
 
   /**
@@ -110,6 +125,47 @@ export default class FileCacheProvider {
       await this.removeOrphans();
       await this.evictOldest();
     });
+  }
+
+  async invalidate(hash: string, expectedGeneration: string) {
+    await FileCacheProvider.mutationQueue.add(async () => {
+      const resolvedPath = path.join(this.config.CACHE_DIR, hash);
+      try {
+        const stats = await fs.stat(resolvedPath, {bigint: true});
+        if (this.getFileGeneration(stats) !== expectedGeneration) {
+          return;
+        }
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+          return;
+        }
+
+        throw error;
+      }
+
+      const model = await prisma.fileCache.findUnique({where: {hash}});
+      if (model) {
+        try {
+          await prisma.fileCache.delete({where: {hash}});
+        } catch (error: unknown) {
+          if ((error as {code?: string}).code !== 'P2025') {
+            throw error;
+          }
+        }
+      }
+
+      try {
+        await fs.unlink(resolvedPath);
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error;
+        }
+      }
+    });
+  }
+
+  private getFileGeneration(stats: {dev: bigint; ino: bigint; mtimeNs: bigint; size: bigint}) {
+    return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}`;
   }
 
   private async finalizeWrite(hash: string, tmpPath: string, finalPath: string) {

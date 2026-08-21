@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import {promises as fs} from 'node:fs';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
-import {Readable} from 'node:stream';
+import {PassThrough, Readable} from 'node:stream';
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 
 const dependencyMocks = vi.hoisted(() => ({
@@ -49,6 +49,26 @@ vi.mock('fluent-ffmpeg', () => ({
   default: dependencyMocks.ffmpeg,
 }));
 
+vi.mock('prism-media', async () => {
+  const {Transform} = await import('node:stream');
+
+  return {
+    default: {
+      opus: {
+        WebmDemuxer: class extends Transform {
+          _transform(chunk: Buffer, _encoding: BufferEncoding, done: (error?: Error | null) => void) {
+            if (chunk.includes(1)) {
+              this.push(Buffer.from([0xf8, 0xff, 0xfe]));
+            }
+
+            done();
+          }
+        },
+      },
+    },
+  };
+});
+
 vi.mock('spotify-web-api-node', () => ({
   default: class {
     clientCredentialsGrant = dependencyMocks.spotifyClientCredentialsGrant;
@@ -76,7 +96,12 @@ vi.mock('../src/utils/debug.js', () => ({
   default: dependencyMocks.debug,
 }));
 
-import Player, {MediaSource, QueuedSong} from '../src/services/player.js';
+import Player, {
+  FfmpegMediaUnavailableError,
+  FfmpegStartupError,
+  MediaSource,
+  QueuedSong,
+} from '../src/services/player.js';
 import ThirdParty from '../src/services/third-party.js';
 import prepareYtDlp from '../src/utils/prepare-yt-dlp.js';
 import {getExecutable, getYouTubeMediaSource, getYtDlpVersion, updateYtDlp} from '../src/utils/yt-dlp.js';
@@ -124,18 +149,50 @@ const flushAsyncWork = async () => {
   }
 };
 
-const makeFfmpegCommand = () => {
+const makeFfmpegCommand = ({deferProcessResult = false, emptyOutput = false, hangOutput = false, headerOnlyOutput = false, startupError, startupErrorAfterOutput}: {
+  deferProcessResult?: boolean;
+  emptyOutput?: boolean;
+  hangOutput?: boolean;
+  headerOnlyOutput?: boolean;
+  startupError?: Error;
+  startupErrorAfterOutput?: Error;
+} = {}) => {
+  const handlers = new Map<string, (...args: unknown[]) => void>();
   const command = {
     audioCodec: vi.fn(() => command),
     inputOptions: vi.fn(() => command),
     kill: vi.fn(),
     noVideo: vi.fn(() => command),
-    on: vi.fn(() => command),
+    on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+      handlers.set(event, handler);
+      return command;
+    }),
     outputFormat: vi.fn(() => command),
-    pipe: vi.fn((destination: {end(): void}) => {
+    pipe: vi.fn((destination: {end(): void; write(chunk: Buffer): void}) => {
+      if (startupError) {
+        handlers.get('error')?.(startupError);
+        return destination;
+      }
+
+      if (hangOutput) {
+        return destination;
+      }
+
+      if (!emptyOutput) {
+        destination.write(Buffer.from([headerOnlyOutput ? 2 : 1]));
+      }
       destination.end();
+      if (deferProcessResult) {
+        return destination;
+      } else if (startupErrorAfterOutput) {
+        handlers.get('error')?.(startupErrorAfterOutput);
+      } else {
+        handlers.get('end')?.();
+      }
       return destination;
     }),
+    triggerError: (error: Error) => handlers.get('error')?.(error),
+    triggerStart: () => handlers.get('start')?.(),
   };
 
   return command;
@@ -417,7 +474,7 @@ describe('OPS-11 yt-dlp extraction and ffmpeg handoff', () => {
   it('hands reconnect and CRLF-normalized headers to ffmpeg', async () => {
     process.env.YT_DLP_PATH = '/fake/yt-dlp';
     const fileCache = {
-      getPathFor: vi.fn().mockResolvedValue(null),
+      getEntryFor: vi.fn().mockResolvedValue(null),
     };
     const player = new Player(fileCache as never, GUILD_ID);
     const song: QueuedSong = {
@@ -456,6 +513,400 @@ describe('OPS-11 yt-dlp extraction and ffmpeg handoff', () => {
 
     stream.destroy();
     await flushAsyncWork();
+  });
+
+  it('rejects an FFmpeg startup failure before reporting a playable stream and redacts the signed URL', async () => {
+    process.env.YT_DLP_PATH = '/fake/yt-dlp';
+    const signedUrl = 'HTTPS://media.example/requested.webm?token=secret';
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({
+      startupError: new Error(`${signedUrl}: Server returned 404 Not Found`),
+    }));
+    const fileCache = {
+      getEntryFor: vi.fn().mockResolvedValue(null),
+    };
+    const player = new Player(fileCache as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Rejected media URL',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 3_600,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    const result = (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+
+    await expect(result).rejects.toEqual(expect.objectContaining({
+      name: 'FfmpegMediaUnavailableError',
+      message: expect.stringContaining('[media URL]'),
+    }));
+    await expect(result).rejects.not.toEqual(expect.objectContaining({
+      message: expect.stringContaining('token=secret'),
+    }));
+    await expect(result).rejects.toBeInstanceOf(FfmpegMediaUnavailableError);
+  });
+
+  it('rejects an empty FFmpeg output instead of reporting playback', async () => {
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({emptyOutput: true}));
+    const player = new Player({
+      getEntryFor: vi.fn().mockResolvedValue({generation: 'cached-generation', path: '/cached/audio.webm'}),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Empty media output',
+      artist: 'Artist',
+      url: 'https://media.example/empty.webm',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.HLS,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    const result = (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+    await expect(result).rejects.toMatchObject({
+      name: 'FfmpegMediaUnavailableError',
+      message: expect.stringContaining('produced no playable Opus audio'),
+    });
+  });
+
+  it('preserves a startup timeout for retry instead of skipping the queue', async () => {
+    vi.useFakeTimers();
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({hangOutput: true}));
+    const player = new Player({
+      getEntryFor: vi.fn().mockResolvedValue({generation: 'cached-generation', path: '/cached/audio.webm'}),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Slow startup',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    const result = (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+    const expectation = expect(result).rejects.toMatchObject({
+      name: 'FfmpegStartupError',
+      message: expect.stringContaining('within 20 seconds'),
+    });
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    await expectation;
+
+    const command = dependencyMocks.ffmpeg.mock.results[0].value as ReturnType<typeof makeFfmpegCommand>;
+    const killsBeforeLateStart = command.kill.mock.calls.length;
+    command.triggerStart();
+    expect(command.kill).toHaveBeenCalledTimes(killsBeforeLateStart + 1);
+    expect(command.kill).toHaveBeenLastCalledWith('SIGKILL');
+  });
+
+  it('waits for the FFmpeg result before classifying output EOF', async () => {
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({
+      emptyOutput: true,
+      startupErrorAfterOutput: new Error('Server returned 403 Forbidden'),
+    }));
+    const player = new Player({
+      getEntryFor: vi.fn().mockResolvedValue({generation: 'cached-generation', path: '/cached/audio.webm'}),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'EOF before process result',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    await expect((player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song)).rejects.toBeInstanceOf(FfmpegStartupError);
+  });
+
+  it('does not accept a container header without a playable Opus packet', async () => {
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({
+      headerOnlyOutput: true,
+    }));
+    const player = new Player({
+      getEntryFor: vi.fn().mockResolvedValue({generation: 'cached-generation', path: '/cached/audio.webm'}),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Header-only output',
+      artist: 'Artist',
+      url: 'https://media.example/header-only.webm',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.HLS,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    await expect((player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song)).rejects.toBeInstanceOf(FfmpegMediaUnavailableError);
+  });
+
+  it('invalidates a corrupt cached input and retries from a fresh media URL', async () => {
+    dependencyMocks.ffmpeg
+      .mockImplementationOnce(() => makeFfmpegCommand({headerOnlyOutput: true}))
+      .mockImplementationOnce(() => makeFfmpegCommand());
+    const invalidate = vi.fn().mockResolvedValue(undefined);
+    const player = new Player({
+      getEntryFor: vi.fn()
+        .mockResolvedValueOnce({generation: 'corrupt-generation', path: '/cached/corrupt.webm'})
+        .mockResolvedValueOnce(null),
+      invalidate,
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Corrupt cached input',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 3_600,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    const stream = await (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+
+    expect(invalidate).toHaveBeenCalledWith(expect.any(String), 'corrupt-generation');
+    expect(dependencyMocks.ffmpeg).toHaveBeenNthCalledWith(1, '/cached/corrupt.webm');
+    expect(dependencyMocks.ffmpeg).toHaveBeenNthCalledWith(2, 'https://media.example/requested.webm');
+    stream.destroy();
+  });
+
+  it('preserves infrastructure-level FFmpeg startup failures', async () => {
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({
+      startupError: new Error('spawn ffmpeg ENOENT'),
+    }));
+    const player = new Player({
+      getEntryFor: vi.fn().mockResolvedValue({generation: 'cached-generation', path: '/cached/audio.webm'}),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Host failure',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    await expect((player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song)).rejects.toBeInstanceOf(FfmpegStartupError);
+  });
+
+  it('preserves transient HTTP failures for retry instead of skipping the queue', async () => {
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({
+      startupError: new Error('Server returned 403 Forbidden'),
+    }));
+    const player = new Player({
+      getEntryFor: vi.fn().mockResolvedValue({generation: 'cached-generation', path: '/cached/audio.webm'}),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Transient media failure',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    await expect((player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song)).rejects.toBeInstanceOf(FfmpegStartupError);
+  });
+
+  it('destroys an in-progress cache destination when FFmpeg fails during startup', async () => {
+    dependencyMocks.execa.mockResolvedValue({
+      stdout: JSON.stringify({
+        ...JSON.parse(VALID_MEDIA_RESPONSE),
+        is_live: false,
+      }),
+    });
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({
+      startupError: new Error('Server returned 404 Not Found'),
+    }));
+    const cacheDestination = new PassThrough();
+    const destroyCacheDestination = vi.spyOn(cacheDestination, 'destroy');
+    const player = new Player({
+      createWriteStream: vi.fn(() => cacheDestination),
+      getEntryFor: vi.fn().mockResolvedValue(null),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Cacheable rejected media',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    await expect((player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song)).rejects.toBeInstanceOf(FfmpegMediaUnavailableError);
+    expect(destroyCacheDestination).toHaveBeenCalledOnce();
+  });
+
+  it('finalizes a cache write only after FFmpeg exits successfully', async () => {
+    dependencyMocks.execa.mockResolvedValue({
+      stdout: JSON.stringify({
+        ...JSON.parse(VALID_MEDIA_RESPONSE),
+        is_live: false,
+      }),
+    });
+    const cacheDestination = new PassThrough();
+    const endCacheDestination = vi.spyOn(cacheDestination, 'end');
+    const player = new Player({
+      createWriteStream: vi.fn(() => cacheDestination),
+      getEntryFor: vi.fn().mockResolvedValue(null),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Successful cache media',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    const stream = await (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+    await vi.waitFor(() => {
+      expect(endCacheDestination).toHaveBeenCalledOnce();
+    });
+    stream.destroy();
+  });
+
+  it('discards an in-progress cache if FFmpeg fails after the first playable packet', async () => {
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({deferProcessResult: true}));
+    dependencyMocks.execa.mockResolvedValue({
+      stdout: JSON.stringify({
+        ...JSON.parse(VALID_MEDIA_RESPONSE),
+        is_live: false,
+      }),
+    });
+    const cacheDestination = new PassThrough();
+    const destroyCacheDestination = vi.spyOn(cacheDestination, 'destroy');
+    const player = new Player({
+      createWriteStream: vi.fn(() => cacheDestination),
+      getEntryFor: vi.fn().mockResolvedValue(null),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Partially playable media',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    const stream = await (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+    const command = dependencyMocks.ffmpeg.mock.results[0].value as ReturnType<typeof makeFfmpegCommand>;
+    command.triggerError(new Error('Server returned 403 Forbidden'));
+    await flushAsyncWork();
+
+    expect(destroyCacheDestination).toHaveBeenCalledOnce();
+    stream.destroy();
+  });
+
+  it('discards an in-progress cache if FFmpeg fails after the playback reader closes', async () => {
+    dependencyMocks.ffmpeg.mockImplementation(() => makeFfmpegCommand({deferProcessResult: true}));
+    dependencyMocks.execa.mockResolvedValue({
+      stdout: JSON.stringify({
+        ...JSON.parse(VALID_MEDIA_RESPONSE),
+        is_live: false,
+      }),
+    });
+    const cacheDestination = new PassThrough();
+    const destroyCacheDestination = vi.spyOn(cacheDestination, 'destroy');
+    const player = new Player({
+      createWriteStream: vi.fn(() => cacheDestination),
+      getEntryFor: vi.fn().mockResolvedValue(null),
+    } as never, GUILD_ID);
+    const song: QueuedSong = {
+      title: 'Stopped partial media',
+      artist: 'Artist',
+      url: 'abcdefghijk',
+      length: 100,
+      offset: 0,
+      playlist: null,
+      isLive: false,
+      thumbnailUrl: null,
+      source: MediaSource.Youtube,
+      addedInChannelId: 'text-channel-id',
+      requestedBy: 'requester-id',
+    };
+
+    const stream = await (player as unknown as {
+      getStream(input: QueuedSong): Promise<Readable>;
+    }).getStream(song);
+    const command = dependencyMocks.ffmpeg.mock.results[0].value as ReturnType<typeof makeFfmpegCommand>;
+    stream.destroy();
+    command.triggerError(new Error('Server returned 403 Forbidden'));
+    await flushAsyncWork();
+
+    expect(destroyCacheDestination).toHaveBeenCalledOnce();
   });
 });
 

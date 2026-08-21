@@ -127,10 +127,12 @@ interface StructuralCommand {
 }
 
 interface StructuralInteraction {
+  channelId: string | null;
   commandName: string;
   deferred: boolean;
   editReply: ReturnType<typeof vi.fn>;
   guild: object | null;
+  guildId: string | null;
   isAutocomplete: () => boolean;
   isButton: () => boolean;
   isChatInputCommand: () => boolean;
@@ -139,6 +141,8 @@ interface StructuralInteraction {
   options: {getSubcommand: () => string};
   replied: boolean;
   reply: ReturnType<typeof vi.fn>;
+  type: number;
+  user: {id: string};
 }
 
 const makeCommand = (name: string, overrides: Partial<StructuralCommand> = {}): StructuralCommand => ({
@@ -187,10 +191,12 @@ const makeClient = (guildIds: string[] = []) => {
 };
 
 const makeInteraction = (commandName: string, overrides: Partial<StructuralInteraction> = {}): StructuralInteraction => ({
+  channelId: 'channel-id',
   commandName,
   deferred: false,
   editReply: vi.fn().mockResolvedValue(undefined),
   guild: {channels: {cache: new Collection()}},
+  guildId: 'guild-id',
   isAutocomplete: () => false,
   isButton: () => false,
   isChatInputCommand: () => true,
@@ -199,6 +205,8 @@ const makeInteraction = (commandName: string, overrides: Partial<StructuralInter
   options: {getSubcommand: () => 'list'},
   replied: false,
   reply: vi.fn().mockResolvedValue(undefined),
+  type: 2,
+  user: {id: 'member-id'},
   ...overrides,
 });
 
@@ -419,6 +427,7 @@ describe('interaction boundaries', () => {
   });
 
   it('debug-logs command failures and sends a fresh ephemeral error response', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const failure = new Error('command failure');
     const command = makeCommand('play', {execute: vi.fn().mockRejectedValue(failure)});
     const {handlers} = await registerBot(true, [command]);
@@ -426,9 +435,34 @@ describe('interaction boundaries', () => {
 
     await invoke(handlers, 'interactionCreate', interaction);
 
-    expect(mocks.debug).toHaveBeenCalledWith(failure);
+    expect(mocks.debug).toHaveBeenCalledWith('Error: command failure');
+    expect(errorLog).toHaveBeenCalledWith('Discord interaction failed (/play, guild=guild-id, channel=channel-id, user=member-id): Error: command failure');
     expect(interaction.reply).toHaveBeenCalledWith({content: '🚫 ope: command failure', ephemeral: true});
     expect(interaction.editReply).not.toHaveBeenCalled();
+  });
+
+  it('redacts case-insensitive URLs from interaction logs and user error responses', async () => {
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const failure = new Error('request HTTPS://user:password@example.test/audio?token=secret failed Authorization: Basic basicsecret\r\nCookie: sid=sessionsecret; refresh=refreshsecret\r\n"token":"jsonsecret"');
+    const command = makeCommand('play', {execute: vi.fn().mockRejectedValue(failure)});
+    const {handlers} = await registerBot(true, [command]);
+    const interaction = makeInteraction('play');
+
+    await invoke(handlers, 'interactionCreate', interaction);
+
+    const sanitized = 'request [URL] failed Authorization: [redacted] Cookie: [redacted] "token":[redacted]';
+    expect(mocks.debug).toHaveBeenCalledWith(`Error: ${sanitized}`);
+    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining(`Error: ${sanitized}`));
+    expect(errorLog.mock.calls.flat().join(' ')).not.toContain('password');
+    expect(errorLog.mock.calls.flat().join(' ')).not.toContain('token=secret');
+    expect(errorLog.mock.calls.flat().join(' ')).not.toContain('basicsecret');
+    expect(errorLog.mock.calls.flat().join(' ')).not.toContain('jsonsecret');
+    expect(errorLog.mock.calls.flat().join(' ')).not.toContain('sessionsecret');
+    expect(errorLog.mock.calls.flat().join(' ')).not.toContain('refreshsecret');
+    expect(interaction.reply).toHaveBeenCalledWith({
+      content: `🚫 ope: ${sanitized}`,
+      ephemeral: true,
+    });
   });
 
   it('edits deferred failures and swallows a failed error response', async () => {

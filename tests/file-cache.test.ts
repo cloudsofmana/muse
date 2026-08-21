@@ -154,6 +154,37 @@ afterEach(async () => {
 });
 
 describe('FileCacheProvider concurrent finalization', () => {
+  it('invalidates both an indexed cache row and its file', async () => {
+    const {cacheDirectory, provider} = await makeProvider();
+    const row = makeRow('corrupt-hash', 7);
+    dependencyMocks.rows.set(row.hash, row);
+    const cachedPath = path.join(cacheDirectory, row.hash);
+    await fs.writeFile(cachedPath, 'corrupt');
+    const entry = await provider.getEntryFor(row.hash);
+
+    await provider.invalidate(row.hash, entry!.generation);
+
+    expect(dependencyMocks.rows.has(row.hash)).toBe(false);
+    expect(await pathExists(cachedPath)).toBe(false);
+  });
+
+  it('does not invalidate a newer file generation for a late failing reader', async () => {
+    const {cacheDirectory, provider} = await makeProvider();
+    const row = makeRow('shared-hash', 7);
+    dependencyMocks.rows.set(row.hash, row);
+    const cachedPath = path.join(cacheDirectory, row.hash);
+    await fs.writeFile(cachedPath, 'corrupt');
+    const staleEntry = await provider.getEntryFor(row.hash);
+
+    await fs.unlink(cachedPath);
+    await fs.writeFile(cachedPath, 'valid replacement');
+    dependencyMocks.rows.set(row.hash, makeRow(row.hash, 17));
+    await provider.invalidate(row.hash, staleEntry!.generation);
+
+    expect(dependencyMocks.rows.has(row.hash)).toBe(true);
+    expect(await fs.readFile(cachedPath, 'utf8')).toBe('valid replacement');
+  });
+
   it('uses unique temporary paths and converges same-hash writers without an unhandled rejection', async () => {
     const {cacheDirectory, provider} = await makeProvider();
     const unhandledRejections: unknown[] = [];

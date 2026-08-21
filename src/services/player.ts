@@ -3,6 +3,7 @@ import {Readable} from 'stream';
 import hasha from 'hasha';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
+import prismMedia from 'prism-media';
 import shuffle from 'array-shuffle';
 import {
   AudioPlayer,
@@ -37,6 +38,56 @@ import {Setting} from '@prisma/client';
 
 export {DEFAULT_VOLUME, MediaSource, STATUS};
 export type {AgeRestrictedFallbackResolver, PlayerEvents, QueuedPlaylist, QueuedSong, SongMetadata};
+
+const FFMPEG_STARTUP_TIMEOUT_MS = 20_000;
+
+const sanitizeFfmpegError = (error: unknown) => {
+  const detail = error instanceof Error ? error.message : String(error);
+
+  return detail
+    .replace(/https?:\/\/\S+/gi, '[media URL]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 500);
+};
+
+const getMediaIdentifierForLog = (song: QueuedSong) => (
+  song.source === MediaSource.Youtube && /^[\w-]{11}$/.test(song.url)
+    ? `youtube=${song.url}`
+    : `sourceHash=${hasha(song.url).slice(0, 16)}`
+);
+
+export class FfmpegMediaUnavailableError extends Error {
+  constructor(error: unknown, public readonly reason: 'invalid-output' | 'not-found' | 'unavailable' = 'unavailable') {
+    const detail = sanitizeFfmpegError(error);
+    super(`FFmpeg could not start audio transcoding${detail ? `: ${detail}` : ''}`);
+    this.name = 'FfmpegMediaUnavailableError';
+  }
+}
+
+export class FfmpegStartupError extends Error {
+  constructor(error: unknown) {
+    const detail = sanitizeFfmpegError(error);
+    super(`FFmpeg could not initialize audio transcoding${detail ? `: ${detail}` : ''}`);
+    this.name = 'FfmpegStartupError';
+  }
+}
+
+const getFfmpegStartupError = (error: unknown) => {
+  const detail = error instanceof Error ? error.message : String(error);
+  const isInvalidOutput = /Invalid data found when processing input/i.test(detail);
+  const isNotFound = /(?:HTTP error|Server returned) (?:404|410)|404 Not Found|410 Gone/i.test(detail);
+
+  if (isInvalidOutput) {
+    return new FfmpegMediaUnavailableError(error, 'invalid-output');
+  }
+
+  if (isNotFound) {
+    return new FfmpegMediaUnavailableError(error, 'not-found');
+  }
+
+  return new FfmpegStartupError(error);
+};
 
 type PlayerPlaybackAttemptContext = PlaybackAttemptContext<QueuedSong, VoiceConnection>;
 
@@ -202,6 +253,7 @@ export default class {
   }
 
   async forward(skip: number): Promise<void> {
+    const originalPosition = this.positionInSeconds;
     const originalQueuePosition = this.queuePosition;
     const originalQueueEntryVersion = this.currentQueueEntryVersion;
     this.manualForward(skip);
@@ -231,6 +283,7 @@ export default class {
         && this.currentQueueEntryVersion === destinationQueueEntryVersion
         && (destinationPlayback === null || this.playbackAttempts.owns(destinationPlayback));
       if (failedTransitionStillOwnsDestination) {
+        this.positionInSeconds = originalPosition;
         this.queuePosition = originalQueuePosition;
         this.currentQueueEntryVersion = originalQueueEntryVersion;
       }
@@ -324,17 +377,47 @@ export default class {
   }
 
   async back(): Promise<void> {
-    if (this.canGoBack()) {
-      this.queuePosition--;
-      this.currentQueueEntryVersion++;
-      this.positionInSeconds = 0;
-      this.stopTrackingPosition();
-
-      if (this.status !== STATUS.PAUSED) {
-        await this.play();
-      }
-    } else {
+    if (!this.canGoBack()) {
       throw new Error('No songs in queue to go back to.');
+    }
+
+    const originalPosition = this.positionInSeconds;
+    const originalQueuePosition = this.queuePosition;
+    const originalQueueEntryVersion = this.currentQueueEntryVersion;
+    this.queuePosition--;
+    this.currentQueueEntryVersion++;
+    this.positionInSeconds = 0;
+    this.stopTrackingPosition();
+    const destinationSong = this.getCurrent();
+    const destinationQueueEntryVersion = this.currentQueueEntryVersion;
+    let destinationPlayback: PlayerPlaybackAttemptContext | null = null;
+
+    try {
+      if (this.status !== STATUS.PAUSED) {
+        const playPromise = this.play();
+        const destinationConnection = this.voiceConnection;
+        if (destinationConnection && destinationSong) {
+          destinationPlayback = this.playbackAttempts.capture(
+            this.playbackAttempts.latest(),
+            destinationSong,
+            destinationQueueEntryVersion,
+            destinationConnection,
+          );
+        }
+
+        await playPromise;
+      }
+    } catch (error: unknown) {
+      const failedTransitionStillOwnsDestination = this.getCurrent() === destinationSong
+        && this.currentQueueEntryVersion === destinationQueueEntryVersion
+        && (destinationPlayback === null || this.playbackAttempts.owns(destinationPlayback));
+      if (failedTransitionStillOwnsDestination) {
+        this.positionInSeconds = originalPosition;
+        this.queuePosition = originalQueuePosition;
+        this.currentQueueEntryVersion = originalQueueEntryVersion;
+      }
+
+      throw error;
     }
   }
 
@@ -486,7 +569,22 @@ export default class {
       to = currentSong.length + currentSong.offset;
     }
 
-    const stream = await this.getStream(currentSong, {seek: realPositionSeconds, to});
+    const previousPosition = this.positionInSeconds;
+    this.stopTrackingPosition();
+    let stream: Readable;
+    try {
+      stream = await this.getStream(currentSong, {seek: realPositionSeconds, to});
+    } catch (error: unknown) {
+      if (this.playbackAttempts.owns(playback)) {
+        this.positionInSeconds = previousPosition;
+        this.audioPlayer = null;
+        this.audioResource = null;
+      }
+
+      await this.handlePlaybackError(error, playback, true);
+      return;
+    }
+
     if (!this.playbackAttempts.owns(playback)) {
       this.destroyStaleStream(stream);
       return;
@@ -558,6 +656,8 @@ export default class {
       }
     }
 
+    const previousPosition = this.positionInSeconds;
+    this.stopTrackingPosition();
     try {
       let positionSeconds: number | undefined;
       let to: number | undefined;
@@ -588,6 +688,13 @@ export default class {
       this.nowPlayingQueueEntryVersion = currentQueueEntryVersion;
       this.startTrackingPosition(0);
     } catch (error: unknown) {
+      if (this.playbackAttempts.owns(playback)) {
+        this.positionInSeconds = previousPosition;
+        this.status = STATUS.PAUSED;
+        this.audioPlayer = null;
+        this.audioResource = null;
+      }
+
       await this.handlePlaybackError(
         error,
         playback,
@@ -623,9 +730,11 @@ export default class {
       }
     }
 
-    if (error instanceof YtDlpMediaUnavailableError || isGone) {
+    if (error instanceof YtDlpMediaUnavailableError
+      || error instanceof FfmpegMediaUnavailableError
+      || isGone) {
       const detail = error instanceof Error ? error.message : 'media returned HTTP 410';
-      console.warn(`Skipping unplayable YouTube track for guild ${this.guildId}: ${detail}`);
+      console.warn(`Skipping unplayable track for guild ${this.guildId} (${getMediaIdentifierForLog(playback.song)}): ${detail}`);
       await this.advancePastUnplayableTrack();
       return;
     }
@@ -652,7 +761,9 @@ export default class {
     const ffmpegInputOptions: string[] = [];
     let shouldCacheVideo = false;
 
-    ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
+    const cacheHash = this.getHashForCache(song.url);
+    const cachedEntry = await this.fileCache.getEntryFor(cacheHash);
+    ffmpegInput = cachedEntry?.path ?? null;
 
     if (!ffmpegInput) {
       const mediaSource = await getYouTubeMediaSource(song.url);
@@ -685,12 +796,23 @@ export default class {
       ffmpegInputOptions.push('-to', options.to.toString());
     }
 
-    return this.createReadStream({
-      url: ffmpegInput,
-      cacheKey: song.url,
-      ffmpegInputOptions,
-      cache: shouldCacheVideo,
-    });
+    try {
+      return await this.createReadStream({
+        url: ffmpegInput,
+        cacheKey: song.url,
+        ffmpegInputOptions,
+        cache: shouldCacheVideo,
+      });
+    } catch (error: unknown) {
+      if (cachedEntry
+        && error instanceof FfmpegMediaUnavailableError
+        && error.reason === 'invalid-output') {
+        await this.fileCache.invalidate(cacheHash, cachedEntry.generation);
+        return this.getStream(song, options);
+      }
+
+      throw error;
+    }
   }
 
   private startTrackingPosition(initalPosition?: number): void {
@@ -913,14 +1035,116 @@ export default class {
   private async createReadStream(options: {url: string; cacheKey: string; ffmpegInputOptions?: string[]; cache?: boolean}): Promise<Readable> {
     return new Promise((resolve, reject) => {
       const capacitor = new WriteStream();
+      const startupProbeStream = capacitor.createReadStream();
+      const opusProbe = new prismMedia.opus.WebmDemuxer();
+      let cacheReadStream: Readable | undefined;
+      let cacheWriteStream: ReturnType<FileCacheProvider['createWriteStream']> | undefined;
 
       if (options?.cache) {
-        const cacheStream = this.fileCache.createWriteStream(this.getHashForCache(options.cacheKey));
-        capacitor.createReadStream().pipe(cacheStream);
+        cacheWriteStream = this.fileCache.createWriteStream(this.getHashForCache(options.cacheKey));
+        cacheReadStream = capacitor.createReadStream();
+        cacheReadStream.pipe(cacheWriteStream, {end: false});
       }
 
       const returnedStream = capacitor.createReadStream();
+      let cacheWriteAborted = false;
+      let cacheReadEnded = false;
+      let ffmpegEnded = false;
       let hasReturnedStreamClosed = false;
+      let startupSettled = false;
+      let startupTimedOut = false;
+      let startupTimeout: NodeJS.Timeout | undefined;
+
+      const cleanupStartupListeners = () => {
+        if (startupTimeout) {
+          clearTimeout(startupTimeout);
+          startupTimeout = undefined;
+        }
+
+        opusProbe.off('data', onPlayablePacket);
+        startupProbeStream.off('end', onEndBeforePlayablePacket);
+      };
+
+      const destroyCacheWrite = () => {
+        if (cacheWriteAborted) {
+          return;
+        }
+
+        cacheWriteAborted = true;
+        cacheReadStream?.destroy();
+        cacheWriteStream?.destroy();
+      };
+
+      const finalizeCacheWriteIfComplete = () => {
+        if (!cacheWriteAborted
+          && cacheReadEnded
+          && ffmpegEnded
+          && cacheWriteStream
+          && !cacheWriteStream.writableEnded) {
+          cacheWriteStream.end();
+        }
+      };
+
+      const rejectStartup = (error: unknown) => {
+        if (startupSettled) {
+          return;
+        }
+
+        startupSettled = true;
+        cleanupStartupListeners();
+        destroyCacheWrite();
+        startupProbeStream.destroy();
+        opusProbe.destroy();
+        returnedStream.destroy();
+        capacitor.destroy();
+        reject(error instanceof FfmpegMediaUnavailableError || error instanceof FfmpegStartupError
+          ? error
+          : new FfmpegStartupError(error));
+      };
+
+      const onPlayablePacket = () => {
+        if (startupSettled) {
+          return;
+        }
+
+        startupSettled = true;
+        cleanupStartupListeners();
+        startupProbeStream.destroy();
+        opusProbe.destroy();
+        resolve(returnedStream);
+      };
+
+      const onEndBeforePlayablePacket = () => {
+        if (ffmpegEnded) {
+          rejectStartup(new FfmpegMediaUnavailableError(
+            new Error('FFmpeg produced no playable Opus audio.'),
+            'invalid-output',
+          ));
+        }
+      };
+
+      const onFfmpegEnd = () => {
+        ffmpegEnded = true;
+        finalizeCacheWriteIfComplete();
+        if (startupProbeStream.readableEnded) {
+          onEndBeforePlayablePacket();
+        }
+      };
+
+      const onBufferError = (error: unknown) => {
+        if (!startupSettled) {
+          rejectStartup(new FfmpegStartupError(error));
+          return;
+        }
+
+        console.error(`Playback buffer failed after playback began for guild ${this.guildId}: ${sanitizeFfmpegError(error)}`);
+        destroyCacheWrite();
+      };
+
+      const onCacheWriteError = (error: unknown) => {
+        console.warn(`Disabling cache write for guild ${this.guildId}: ${sanitizeFfmpegError(error)}`);
+        destroyCacheWrite();
+      };
 
       const stream = ffmpeg(options.url)
         .inputOptions(options?.ffmpegInputOptions ?? ['-re'])
@@ -928,13 +1152,52 @@ export default class {
         .audioCodec('libopus')
         .outputFormat('webm')
         .on('error', error => {
-          if (!hasReturnedStreamClosed) {
-            reject(error);
+          destroyCacheWrite();
+
+          if (hasReturnedStreamClosed) {
+            return;
+          }
+
+          if (!startupSettled) {
+            rejectStartup(getFfmpegStartupError(error));
+            return;
+          }
+
+          console.error(`FFmpeg stream failed after playback began for guild ${this.guildId}: ${sanitizeFfmpegError(error)}`);
+          if (!capacitor.writableEnded) {
+            capacitor.end();
           }
         })
-        .on('start', command => {
-          debug(`Spawned ffmpeg with ${command}`);
-        });
+        .on('start', () => {
+          if (startupTimedOut) {
+            stream.kill('SIGKILL');
+            return;
+          }
+
+          debug('Spawned ffmpeg for playback');
+        })
+        .on('end', onFfmpegEnd);
+
+      capacitor.on('error', onBufferError);
+      startupProbeStream.on('error', onBufferError);
+      returnedStream.on('error', onBufferError);
+      opusProbe.on('error', onBufferError);
+      cacheReadStream?.on('error', onCacheWriteError);
+      cacheReadStream?.once('end', () => {
+        cacheReadEnded = true;
+        finalizeCacheWriteIfComplete();
+      });
+      cacheWriteStream?.on('error', onCacheWriteError);
+      opusProbe.once('data', onPlayablePacket);
+      startupProbeStream.once('end', onEndBeforePlayablePacket);
+      startupProbeStream.pipe(opusProbe);
+      startupTimeout = setTimeout(() => {
+        startupTimedOut = true;
+        stream.kill('SIGKILL');
+        rejectStartup(new FfmpegStartupError(
+          new Error(`FFmpeg produced no playable audio within ${FFMPEG_STARTUP_TIMEOUT_MS / 1000} seconds.`),
+        ));
+      }, FFMPEG_STARTUP_TIMEOUT_MS);
 
       stream.pipe(capacitor);
 
@@ -945,8 +1208,6 @@ export default class {
 
         hasReturnedStreamClosed = true;
       });
-
-      resolve(returnedStream);
     });
   }
 

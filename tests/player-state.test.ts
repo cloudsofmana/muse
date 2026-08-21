@@ -116,6 +116,7 @@ const getPrivateState = (player: Player) => player as unknown as {
   nowPlaying: QueuedSong | null;
   nowPlayingQueueEntryVersion: number | null;
   playAudioPlayerResource(resource: object): void;
+  startTrackingPosition(position?: number): void;
 };
 
 const installVoiceActivityFakes = (player: Player) => {
@@ -166,18 +167,90 @@ afterEach(() => {
 });
 
 describe('Player forward state transitions', () => {
+  it('clears a stopped audio player after a failed seek so play can retry the prior position', async () => {
+    const {getStream, player} = makeReadyPlayer();
+    const song = makeSong('Seek retry');
+    const oldAudioPlayer = makeAudioPlayer();
+    player.add(song);
+    player.status = STATUS.PLAYING;
+    Object.assign(player, {
+      audioPlayer: oldAudioPlayer,
+      nowPlaying: song,
+      nowPlayingQueueEntryVersion: 1,
+    });
+    getPrivateState(player).startTrackingPosition(12);
+    const seekFailure = makeDeferred<Readable>();
+    getStream.mockReturnValueOnce(seekFailure.promise);
+
+    const seek = player.seek(30);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(20_000);
+    seekFailure.reject(new Error('transient FFmpeg failure'));
+    await expect(seek).rejects.toThrow('transient FFmpeg failure');
+
+    expect(getPrivateState(player).audioPlayer).toBeNull();
+    expect(player.status).toBe(STATUS.PAUSED);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(player.getPosition()).toBe(12);
+
+    getStream.mockResolvedValueOnce(Readable.from([]));
+    await player.play();
+
+    expect(getStream).toHaveBeenLastCalledWith(song, {seek: 12, to: 100});
+    expect(player.status).toBe(STATUS.PLAYING);
+    expect(getPrivateState(player).audioPlayer).not.toBeNull();
+  });
+
+  it('restores a retryable paused state after a transient play startup failure', async () => {
+    const {getStream, player} = makeReadyPlayer();
+    const song = makeSong('Transient retry');
+    player.add(song);
+    player.status = STATUS.PLAYING;
+    Object.assign(player, {
+      audioPlayer: makeAudioPlayer(),
+      nowPlaying: song,
+      nowPlayingQueueEntryVersion: 1,
+    });
+    getPrivateState(player).startTrackingPosition(9);
+    getStream.mockRejectedValueOnce(new Error('transient FFmpeg failure'));
+
+    await expect(player.play()).rejects.toThrow('transient FFmpeg failure');
+
+    expect(player.status).toBe(STATUS.PAUSED);
+    expect(getPrivateState(player).audioPlayer).toBeNull();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(player.getPosition()).toBe(9);
+  });
+
   it('restores the exact original queue position when a multi-skip destination fails to play', async () => {
     const player = new Player({} as never, GUILD_ID);
     player.add(makeSong('Original'));
     player.add(makeSong('Skipped'));
     player.add(makeSong('Failed destination'));
     player.status = STATUS.PLAYING;
+    Object.assign(player, {positionInSeconds: 47});
     vi.spyOn(player, 'play').mockRejectedValue(new Error('playback failed'));
 
     await expect(player.forward(2)).rejects.toThrow('playback failed');
 
     expect(player.getCurrent()?.title).toBe('Original');
+    expect(player.getPosition()).toBe(47);
     expect(player.getQueue().map(song => song.title)).toEqual(['Skipped', 'Failed destination']);
+  });
+
+  it('restores the exact original queue position when an unskip destination fails to play', async () => {
+    const player = new Player({} as never, GUILD_ID);
+    player.add(makeSong('Previous'));
+    player.add(makeSong('Original'));
+    player.manualForward(1);
+    player.status = STATUS.PLAYING;
+    Object.assign(player, {positionInSeconds: 31});
+    vi.spyOn(player, 'play').mockRejectedValue(new Error('playback failed'));
+
+    await expect(player.back()).rejects.toThrow('playback failed');
+
+    expect(player.getCurrent()?.title).toBe('Original');
+    expect(player.getPosition()).toBe(31);
   });
 
   it('moves a paused non-empty queue forward while remaining paused and never schedules idle disconnect', async () => {
