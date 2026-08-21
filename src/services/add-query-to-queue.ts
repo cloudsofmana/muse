@@ -17,6 +17,12 @@ const isSameQueueEntry = (capturedId: number | null, currentId: number | null) =
   capturedId !== null && capturedId === currentId
 );
 
+const normalizeSkipError = (error: unknown) => (
+  error instanceof Error && error.message === 'No songs in queue to forward to.'
+    ? new Error('no song to skip to')
+    : error
+);
+
 @injectable()
 export default class AddQueryToQueue {
   private readonly sponsorBlock?: SponsorBlock;
@@ -124,8 +130,8 @@ export default class AddQueryToQueue {
       try {
         await player.forward(1);
         didSkipCurrentTrack = true;
-      } catch (_: unknown) {
-        throw new Error('no song to skip to');
+      } catch (error: unknown) {
+        throw normalizeSkipError(error);
       }
     }
 

@@ -15,6 +15,24 @@ import {REST} from '@discordjs/rest';
 import {Routes} from 'discord-api-types/v10';
 import registerCommandsOnGuild from './utils/register-commands-on-guild.js';
 
+const sanitizeErrorDetail = (error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  return message
+    .replace(/https?:\/\/\S+/gi, '[URL]')
+    .replace(/(["']?\b(?:api[-_]?key|key|token|authorization|cookie)["']?\s*[:=]\s*)(?:["'][^"']*["']|Bearer\s+[^,;\s]+|[^,;\s}\]]+)/gi, '$1[redacted]')
+    .replace(/\b(authorization|cookie)\s*[:=]\s*[^\r\n]*/gi, '$1: [redacted]')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 500);
+};
+
+const sanitizeErrorForLog = (error: unknown) => {
+  const name = error instanceof Error ? error.name : 'Error';
+  const detail = sanitizeErrorDetail(error);
+
+  return `${name}: ${detail || 'unknown error'}`;
+};
+
 @injectable()
 export default class {
   private readonly client: Client;
@@ -100,14 +118,22 @@ export default class {
           }
         }
       } catch (error: unknown) {
-        debug(error);
+        const sanitizedError = sanitizeErrorForLog(error);
+        debug(sanitizedError);
+        const interactionName = interaction.isCommand() || interaction.isAutocomplete()
+          ? `/${interaction.commandName}`
+          : interaction.isButton()
+            ? `button:${interaction.customId}`
+            : interaction.type.toString();
+        console.error(`Discord interaction failed (${interactionName}, guild=${interaction.guildId ?? 'dm'}, channel=${interaction.channelId ?? 'unknown'}, user=${interaction.user.id}): ${sanitizedError}`);
+        const userSafeError = new Error(sanitizeErrorDetail(error));
 
         // This can fail if the message was deleted, and we don't want to crash the whole bot
         try {
           if ((interaction.isCommand() || interaction.isButton()) && (interaction.replied || interaction.deferred)) {
-            await interaction.editReply(errorMsg(error as Error));
+            await interaction.editReply(errorMsg(userSafeError));
           } else if (interaction.isCommand() || interaction.isButton()) {
-            await interaction.reply({content: errorMsg(error as Error), ephemeral: true});
+            await interaction.reply({content: errorMsg(userSafeError), ephemeral: true});
           }
         } catch {}
       }

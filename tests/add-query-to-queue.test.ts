@@ -194,6 +194,16 @@ describe('AddQueryToQueue skip semantics', () => {
     expect(interaction.editReply).toHaveBeenLastCalledWith('u betcha, **New song** added to the queue and current track skipped');
   });
 
+  it('preserves playback startup failures from the skip path', async () => {
+    const player = makePausedPlayer(makeQueuedSong('Existing song'));
+    const failure = new Error('FFmpeg startup failed');
+    vi.spyOn(player, 'forward').mockRejectedValue(failure);
+    const {service} = makeService({player});
+    const interaction = makeInteraction();
+
+    await expect(addToQueue(service, interaction, {skip: true})).rejects.toBe(failure);
+  });
+
   it('does not skip after the captured current entry advances while song lookup is blocked', async () => {
     const player = makePausedPlayer(
       makeQueuedSong('Captured current'),

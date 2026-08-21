@@ -6,6 +6,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Detect FFmpeg failures before reporting playback as started, skip failed queued tracks instead of wedging the player, and retain bounded failure details in the container log.
+- Log failed Discord interactions with command and guild context so playback incidents can be diagnosed after the fact.
+
 ## [2.11.6] - 2026-07-12
 
 - Add optional age-verified YouTube cookie-file support for age-restricted playback.
