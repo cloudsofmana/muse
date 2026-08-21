@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.11.7] - 2026-08-20
+
 - Detect FFmpeg failures before reporting playback as started, skip failed queued tracks instead of wedging the player, and retain bounded failure details in the container log.
 - Log failed Discord interactions with command and guild context so playback incidents can be diagnosed after the fact.
 
@@ -407,7 +409,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release
 
-[unreleased]: https://github.com/museofficial/muse/compare/v2.11.6...HEAD
+[unreleased]: https://github.com/museofficial/muse/compare/v2.11.7...HEAD
+[2.11.7]: https://github.com/museofficial/muse/compare/v2.11.6...v2.11.7
 [2.11.6]: https://github.com/museofficial/muse/compare/v2.11.5...v2.11.6
 [2.11.5]: https://github.com/museofficial/muse/compare/v2.11.4...v2.11.5
 [2.11.4]: https://github.com/museofficial/muse/compare/v2.11.3...v2.11.4
